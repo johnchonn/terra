@@ -1,0 +1,64 @@
+# To be able to refer to the AWS account being used to run TF
+# without hard-coding the account ID in multiple places.
+data "aws_caller_identity" "THIS_AWS_ACCOUNT" {}
+
+data external "GET_RANDOM_PUBLIC_INSTANCE_HOSTNAME" {
+    program = [
+        "bash",
+        "-c",
+        <<-EOT
+            JSON1=$(aws --profile ${local.aws_admin_user} --region us-west-2 autoscaling describe-auto-scaling-groups)
+            SOME_HEALTHY_INSTANCE=$(echo "$JSON1" | jq -r '[.AutoScalingGroups[] | select(.AutoScalingGroupName == "${aws_autoscaling_group.ALEX_AUTOSCALING_GROUP.name}") | .Instances[] | select(.LifecycleState == "InService") | .InstanceId][0]')
+            JSON2=$(aws --profile ${local.aws_admin_user} --region us-west-2 ec2 describe-instances --instance-ids $SOME_HEALTHY_INSTANCE)
+            ITS_PUBLIC_HOSTNAME=$(echo "$JSON2" | jq -r '.Reservations[0].Instances[0].PublicDnsName')
+            echo "{\"host\": \"$ITS_PUBLIC_HOSTNAME\"}"
+        EOT
+    ]
+    depends_on = [aws_db_instance.ALEX_POSTGRES_DATABASE, aws_autoscaling_group.ALEX_AUTOSCALING_GROUP]
+}
+
+resource null_resource "RDS_BOOTSTRAPPER" {
+    triggers = { rds_id = aws_db_instance.ALEX_POSTGRES_DATABASE.arn }
+
+    connection {
+        type = "ssh"
+        user = "ubuntu"
+        host = lookup(data.external.GET_RANDOM_PUBLIC_INSTANCE_HOSTNAME.result, "host")
+        private_key = file("~/code/terra/terra")
+    }
+
+    provisioner "file" {
+        source = "./sql.sql"
+        destination = "/home/ubuntu/sql.sql"
+    }
+
+    provisioner "remote-exec" {
+        inline = [
+          <<-EOT
+          for i in {1..10}; do
+            if [ -z $(which psql) ]; then
+              echo 'wating for psql!'
+              sleep 5
+            else
+              echo 'psql is ready!'
+              break
+            fi
+          done
+          EOT
+          ,
+          <<-EOT
+          PGPASSWORD=${local.postgres_password} psql \
+            -h ${aws_db_instance.ALEX_POSTGRES_DATABASE.address} \
+            -U ${local.postgres_user} \
+            --dbname remember \
+            -f /home/ubuntu/sql.sql
+          EOT
+        ]
+    }
+
+    depends_on = [aws_db_instance.ALEX_POSTGRES_DATABASE, aws_autoscaling_group.ALEX_AUTOSCALING_GROUP]
+}
+
+output HOSTNAME_USED_TO_INITIALIZE_RDS {
+    value = lookup(data.external.GET_RANDOM_PUBLIC_INSTANCE_HOSTNAME.result, "host")
+}
